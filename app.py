@@ -29,7 +29,7 @@ def download_nltk_data():
         nltk.download('stopwords')
 
 class MITREMapper:
-    def _init_(self, use_semantic=True):
+    def __init__(self, use_semantic=True):
         """
         Initialize the MITRE ATT&CK mapper
         
