@@ -8,26 +8,24 @@ from urllib3.util.retry import Retry
 from typing import List, Tuple, Dict, Optional
 import warnings
 warnings.filterwarnings('ignore')
-
-# Core libraries
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
 import string
+import threading
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import sys
+import os
 
-# Download required NLTK data
-@st.cache_resource
-def download_nltk_data():
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt')
-    
-    try:
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('stopwords')
+# Try to import NLTK with graceful fallback
+try:
+    import nltk
+    from nltk.corpus import stopwords
+    from nltk.tokenize import word_tokenize
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
+    st.warning("⚠️ NLTK not installed. Using basic text processing. Install with: pip install nltk")
 
+# Your existing MITREMapper class (keeping the same code)
 class MITREMapper:
     def __init__(self, use_semantic=True):
         """
@@ -181,22 +179,55 @@ class MITREMapper:
             self.mitre_embeddings = self.model.encode(self.mitre_texts, convert_to_tensor=True)
 
         except ImportError:
+            st.warning("⚠️ sentence-transformers not installed. Semantic matching disabled.")
             self.use_semantic = False
         except Exception as e:
+            st.warning(f"⚠️ Semantic matching initialization failed: {str(e)}")
             self.use_semantic = False
 
     def extract_keywords(self, text):
         """Extract meaningful keywords from alert text"""
-        try:
-            stop_words = set(stopwords.words('english') + list(string.punctuation))
-            words = word_tokenize(text.lower())
-            keywords = [word for word in words if word.isalpha() and len(word) > 2 and word not in stop_words]
-            return keywords
-        except:
-            # Fallback to simple splitting if NLTK fails
-            words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
-            common_stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use'}
-            return [word for word in words if word not in common_stop_words]
+        if NLTK_AVAILABLE:
+            try:
+                # Download stopwords if not available
+                try:
+                    stop_words = set(stopwords.words('english'))
+                except LookupError:
+                    try:
+                        nltk.download('stopwords')
+                        stop_words = set(stopwords.words('english'))
+                    except:
+                        stop_words = set()
+                
+                stop_words.update(set(string.punctuation))
+                
+                # Tokenize with fallback
+                try:
+                    words = word_tokenize(text.lower())
+                except LookupError:
+                    try:
+                        nltk.download('punkt')
+                        words = word_tokenize(text.lower())
+                    except:
+                        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+                
+                keywords = [word for word in words if word.isalpha() and len(word) > 2 and word not in stop_words]
+                return keywords
+            except Exception as e:
+                # Fall through to basic processing
+                pass
+        
+        # Fallback to simple splitting if NLTK fails or unavailable
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+        common_stop_words = {
+            'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 
+            'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 
+            'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 
+            'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use', 'with', 'from',
+            'they', 'this', 'that', 'will', 'been', 'have', 'were', 'said', 'each',
+            'which', 'their', 'time', 'into', 'than', 'only', 'come', 'very', 'after'
+        }
+        return [word for word in words if word not in common_stop_words]
 
     def exact_name_matching(self, alert_text, keywords):
         """Perform exact name matching"""
@@ -250,6 +281,7 @@ class MITREMapper:
             return matches
 
         except Exception as e:
+            st.warning(f"⚠️ Semantic matching failed: {str(e)}")
             return []
 
     def map_alert_to_mitre(self, alert_text, combine_methods=True, top_k=1):
@@ -291,10 +323,35 @@ class MITREMapper:
 
         return final_matches
 
+# Download required NLTK data
+@st.cache_resource
+def download_nltk_data():
+    if not NLTK_AVAILABLE:
+        return False
+    
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        try:
+            nltk.download('punkt')
+        except Exception:
+            return False
+    
+    try:
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        try:
+            nltk.download('stopwords')
+        except Exception:
+            return False
+    
+    return True
+
 # Initialize the mapper (cached for performance)
 @st.cache_resource
 def get_mitre_mapper():
-    download_nltk_data()
+    if NLTK_AVAILABLE:
+        download_nltk_data()
     return MITREMapper(use_semantic=True)
 
 # Function to process JSON input and return JSON output
@@ -307,14 +364,17 @@ def process_mitre_mapping(json_input):
         else:
             input_data = json_input
         
-        # Extract rule name/text
-        rule_text = input_data.get('rulename', '') or input_data.get('rule_text', '') or input_data.get('text', '')
+        # Extract rule name/text - support n8n format
+        rule_text = (input_data.get('ruleName', '') or 
+                    input_data.get('rulename', '') or 
+                    input_data.get('rule_text', '') or 
+                    input_data.get('text', ''))
         top_k = input_data.get('top_k', 1)
         
         if not rule_text:
             return {
                 "status": "error",
-                "message": "No rule text provided. Please include 'rulename', 'rule_text', or 'text' in your JSON input.",
+                "message": "No rule text provided. Please include 'ruleName', 'rulename', 'rule_text', or 'text' in your JSON input.",
                 "results": []
             }
         
@@ -356,19 +416,139 @@ def process_mitre_mapping(json_input):
             "results": []
         }
 
-# Streamlit App
+# Flask API for n8n integration
+flask_app = Flask(__name__)
+CORS(flask_app)  # Enable CORS for cross-origin requests
+
+@flask_app.route('/api/map', methods=['POST'])
+def api_map_rule():
+    """API endpoint for mapping single rule to MITRE ATT&CK"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        # Process using existing function
+        result = process_mitre_mapping(data)
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@flask_app.route('/api/map-batch', methods=['POST'])
+def api_map_multiple_rules():
+    """API endpoint for mapping multiple rules to MITRE ATT&CK"""
+    try:
+        data = request.get_json()
+        
+        if not data or not isinstance(data, list):
+            return jsonify({"error": "Expected array of rule objects"}), 400
+        
+        results = []
+        for item in data:
+            result = process_mitre_mapping(item)
+            results.append(result)
+        
+        return jsonify({
+            "batch_results": results,
+            "total_processed": len(data),
+            "success_count": sum(1 for r in results if r.get("status") == "success"),
+            "error_count": sum(1 for r in results if r.get("status") == "error")
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@flask_app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    try:
+        mapper = get_mitre_mapper()
+        return jsonify({
+            "status": "healthy",
+            "service": "MITRE Mapping API",
+            "techniques_loaded": len(mapper.mitre_data),
+            "semantic_enabled": mapper.use_semantic
+        })
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+
+@flask_app.route('/api/docs', methods=['GET'])
+def api_docs():
+    """API documentation endpoint"""
+    return jsonify({
+        "service": "MITRE ATT&CK Mapping API",
+        "version": "1.0.0",
+        "endpoints": {
+            "/api/map": {
+                "method": "POST",
+                "description": "Map single rule to MITRE ATT&CK",
+                "input": {"ruleName": "string", "top_k": "integer (optional)"},
+                "output": {"status": "string", "results": "array"}
+            },
+            "/api/map-batch": {
+                "method": "POST", 
+                "description": "Map multiple rules to MITRE ATT&CK",
+                "input": "array of rule objects",
+                "output": {"batch_results": "array", "total_processed": "integer"}
+            },
+            "/api/health": {
+                "method": "GET",
+                "description": "Health check",
+                "output": {"status": "string", "techniques_loaded": "integer"}
+            }
+        },
+        "example_input": {
+            "ruleName": "Ransomware Multiple File Extension Change Activity Detected on System",
+            "top_k": 1
+        }
+    })
+
+def run_flask():
+    """Run Flask API in a separate thread"""
+    try:
+        flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
+    except Exception as e:
+        print(f"Flask startup error: {e}")
+
+# Start Flask API in background
+if 'flask_started' not in st.session_state:
+    try:
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        st.session_state.flask_started = True
+        time.sleep(2)  # Give Flask time to start
+    except Exception as e:
+        st.error(f"Failed to start API server: {e}")
+
+# Streamlit App (keeping your existing UI)
 def main():
     st.set_page_config(
         page_title="MITRE ATT&CK Mapping Platform",
-        page_icon="🛡",
+        page_icon="🛡️",
         layout="wide"
     )
     
-    st.title("🛡 MITRE ATT&CK Mapping Platform")
+    st.title("🛡️ MITRE ATT&CK Mapping Platform")
     st.markdown("Map security rules and alerts to MITRE ATT&CK techniques using exact matching and semantic similarity.")
     
+    # API Status indicator
+    st.sidebar.markdown("### 🔌 API Status")
+    try:
+        response = requests.get("http://localhost:5000/api/health", timeout=5)
+        if response.status_code == 200:
+            st.sidebar.success("✅ API Server Online")
+            health_data = response.json()
+            st.sidebar.info(f"📊 {health_data.get('techniques_loaded', 0)} techniques loaded")
+        else:
+            st.sidebar.error("❌ API Server Error")
+    except:
+        st.sidebar.warning("⚠️ API Server Starting...")
+    
     # Create tabs
-    tab1, tab2, tab3 = st.tabs(["🔍 Interactive Mapping", "🔌 API Interface", "📖 Documentation"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🔍 Interactive Mapping", "🔌 API Interface", "🧪 n8n Testing", "📖 Documentation"])
     
     with tab1:
         st.header("Interactive MITRE Mapping")
@@ -383,14 +563,14 @@ def main():
                 rule_text = st.text_area(
                     "Enter your security rule or alert description:",
                     height=100,
-                    placeholder="e.g., Attacker injects arbitrary code into the genuine live process..."
+                    placeholder="e.g., Ransomware Multiple File Extension Change Activity Detected on System"
                 )
                 top_k = st.slider("Number of results to return:", 1, 5, 1)
                 
                 if st.button("🔍 Map to MITRE ATT&CK", type="primary"):
                     if rule_text:
                         with st.spinner("Analyzing and mapping to MITRE ATT&CK..."):
-                            json_input = {"rulename": rule_text, "top_k": top_k}
+                            json_input = {"ruleName": rule_text, "top_k": top_k}
                             result = process_mitre_mapping(json_input)
                             
                             # Display results
@@ -401,11 +581,11 @@ def main():
                                     with st.expander(f"#{i} - {match['technique_name']} ({match['technique_id']})"):
                                         col_a, col_b = st.columns(2)
                                         with col_a:
-                                            st.write(f"*Confidence Score:* {match['confidence_score']}")
-                                            
+                                            st.write(f"**Confidence Score:** {match['confidence_score']}")
+                                            st.write(f"**Match Method:** {match['match_method']}")
                                         with col_b:
-                                            st.write(f"*Tactics:* {', '.join(match['tactics']) if match['tactics'] else 'None'}")
-                                        
+                                            st.write(f"**Tactics:** {', '.join(match['tactics']) if match['tactics'] else 'None'}")
+                                        st.write(f"**Description:** {match['description']}")
                             else:
                                 st.error(f"❌ {result['message']}")
                     else:
@@ -415,7 +595,7 @@ def main():
                 json_input_text = st.text_area(
                     "Enter JSON input:",
                     height=150,
-                    placeholder='{"rulename": "Your security rule description here", "top_k": 1}'
+                    placeholder='{"ruleName": "Your security rule description here", "top_k": 1}'
                 )
                 
                 if st.button("🔍 Process JSON Input", type="primary"):
@@ -439,99 +619,211 @@ def main():
                 mapper = get_mitre_mapper()
                 st.metric("Total MITRE Techniques", len(mapper.mitre_data))
                 st.metric("Semantic Matching", "✅ Enabled" if mapper.use_semantic else "❌ Disabled")
-            except:
-                st.metric("Status", "⚠ Loading...")
+            except Exception as e:
+                st.metric("Status", "⚠️ Loading...")
+                st.error(f"Error loading mapper: {str(e)}")
     
     with tab2:
         st.header("🔌 API Interface")
         st.markdown("Use these endpoints to integrate with your applications:")
         
-        # API endpoints info
-        st.subheader("Endpoint Information")
-        base_url = st.text_input("Your Streamlit App URL:", value="http://localhost:8501")
+        # Get current URL
+        current_url = st.text_input("Your Streamlit App URL:", 
+                                   value="https://diya5772-mitre-mapping-app-iubskf.streamlit.app")
         
-        st.code(f"""
-# API Endpoint (if deployed with API framework)
-POST {base_url}/api/map
-
-# Example using curl:
-curl -X POST "{base_url}/api/map" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"rulename": "Suspicious process injection detected", "top_k": 2}}'
-        """, language="bash")
+        st.subheader("📡 Available Endpoints")
         
-        st.subheader("📥 Input Format")
+        endpoints = {
+            "/api/map": "Map single rule to MITRE ATT&CK",
+            "/api/map-batch": "Map multiple rules to MITRE ATT&CK", 
+            "/api/health": "Health check",
+            "/api/docs": "API documentation"
+        }
+        
+        for endpoint, description in endpoints.items():
+            st.code(f"POST {current_url}{endpoint}")
+            st.write(f"📝 {description}")
+        
+        st.subheader("📥 Input Format (for n8n)")
         st.json({
-            "rulename": "Your security rule or alert description",
-            "top_k": 1
+            "ruleName": "Ransomware Multiple File Extension Change Activity Detected on System"
         })
         
         st.subheader("📤 Output Format")
         st.json({
             "status": "success",
-            "input_text": "Your input text",
+            "input_text": "Ransomware Multiple File Extension Change Activity Detected on System",
             "total_matches": 1,
             "results": [
                 {
-                    "technique_id": "T1055",
-                    "technique_name": "Process Injection",
+                    "technique_id": "T1486",
+                    "technique_name": "Data Encrypted for Impact",
                     "confidence_score": 0.95,
                     "match_method": "exact_name",
-                    "tactics": ["defense-evasion", "privilege-escalation"],
-                    "description": "Adversaries may inject code into processes..."
+                    "tactics": ["impact"],
+                    "description": "Adversaries may encrypt data on target systems..."
+                }
+            ]
+        })
+    
+    with tab3:
+        st.header("🧪 n8n Integration Testing")
+        st.markdown("Test your API endpoints for n8n integration:")
+        
+        # Test single mapping
+        st.subheader("Test Single Rule Mapping")
+        test_rule = st.text_input("Rule to test:", 
+                                 value="Ransomware Multiple File Extension Change Activity Detected on System")
+        
+        if st.button("🧪 Test API Call"):
+            if test_rule:
+                try:
+                    test_data = {"ruleName": test_rule}
+                    response = requests.post("http://localhost:5000/api/map", 
+                                           json=test_data, 
+                                           timeout=30)
+                    
+                    if response.status_code == 200:
+                        st.success("✅ API Response Successful!")
+                        result = response.json()
+                        st.json(result)
+                        
+                        # Show n8n-formatted output
+                        st.subheader("📤 n8n Output Format")
+                        if result.get("status") == "success" and result.get("results"):
+                            first_result = result["results"][0]
+                            n8n_output = {
+                                "ruleName": test_rule,
+                                "techniqueId": first_result.get("technique_id"),
+                                "techniqueName": first_result.get("technique_name"),
+                                "tactics": first_result.get("tactics", []),
+                                "confidenceScore": first_result.get("confidence_score"),
+                                "description": first_result.get("description")
+                            }
+                            st.json(n8n_output)
+                    else:
+                        st.error(f"❌ API Error: {response.status_code}")
+                        st.text(response.text)
+                except Exception as e:
+                    st.error(f"🔌 Connection error: {str(e)}")
+                    st.info("💡 Make sure the API server is running. Try refreshing the page.")
+        
+        # Test batch mapping
+        st.subheader("Test Batch Rule Mapping")
+        st.markdown("Test with multiple rules (like n8n array input):")
+        
+        batch_test_data = [
+            {"ruleName": "Ransomware Multiple File Extension Change Activity Detected on System"},
+            {"ruleName": "Suspicious process injection detected"}
+        ]
+        
+        st.json(batch_test_data)
+        
+        if st.button("🧪 Test Batch API Call"):
+            try:
+                response = requests.post("http://localhost:5000/api/map-batch", 
+                                       json=batch_test_data, 
+                                       timeout=30)
+                
+                if response.status_code == 200:
+                    st.success("✅ Batch API Response Successful!")
+                    st.json(response.json())
+                else:
+                    st.error(f"❌ Batch API Error: {response.status_code}")
+                    st.text(response.text)
+            except Exception as e:
+                st.error(f"🔌 Batch connection error: {str(e)}")
+    
+    with tab4:
+        st.header("📖 n8n Integration Documentation")
+        
+        st.subheader("🎯 Quick Setup for n8n")
+        st.markdown("""
+        **Step 1:** Use your deployed Streamlit app URL  
+        **Step 2:** Add HTTP Request node in n8n  
+        **Step 3:** Configure as shown below  
+        """)
+        
+        st.subheader("⚙️ n8n HTTP Request Node Configuration")
+        
+        config_data = {
+            "Method": "POST",
+            "URL": f"{current_url}/api/map",
+            "Headers": {
+                "Content-Type": "application/json"
+            },
+            "Body": {
+                "Type": "JSON",
+                "Content": '{{ JSON.stringify($json) }}'
+            }
+        }
+        
+        st.json(config_data)
+        
+        st.subheader("📥 Expected n8n Input Format")
+        st.markdown("Your previous node should output:")
+        st.json([{"ruleName": "Ransomware Multiple File Extension Change Activity Detected on System"}])
+        
+        st.subheader("📤 n8n Output Format")
+        st.markdown("The HTTP Request node will return:")
+        st.json({
+            "status": "success",
+            "input_text": "Ransomware Multiple File Extension Change Activity Detected on System",
+            "total_matches": 1,
+            "results": [
+                {
+                    "technique_id": "T1486",
+                    "technique_name": "Data Encrypted for Impact",
+                    "confidence_score": 0.95,
+                    "match_method": "exact_name",
+                    "tactics": ["impact"],
+                    "description": "Adversaries may encrypt data on target systems..."
                 }
             ]
         })
         
-        st.subheader("🧪 Test API")
-        test_json = st.text_area(
-            "Test JSON input:",
-            value='{"rulename": "Process injection attack detected", "top_k": 2}',
-            height=100
-        )
-        
-        if st.button("🧪 Test API Call"):
-            result = process_mitre_mapping(test_json)
-            st.json(result)
-    
-    with tab3:
-        st.header("📖 Documentation")
-        
-        st.subheader("🎯 Purpose")
+        st.subheader("🔄 Processing the Output in n8n")
         st.markdown("""
-        This platform maps security rules, alerts, and threat descriptions to MITRE ATT&CK techniques using:
-        - *Exact Name Matching*: Direct matching of technique names
-        - *Keyword Matching*: Partial word matching with scoring
-        - *Semantic Similarity*: AI-powered contextual matching using sentence transformers
+        **To extract specific values in n8n, use these expressions:**
+        
+        - **First technique ID:** `{{ $json.results[0].technique_id }}`
+        - **First technique name:** `{{ $json.results[0].technique_name }}`
+        - **All tactics:** `{{ $json.results[0].tactics }}`
+        - **Confidence score:** `{{ $json.results[0].confidence_score }}`
         """)
         
-        st.subheader("📝 Input Options")
+        st.subheader("⚠️ Error Handling in n8n")
         st.markdown("""
-        *JSON Fields (at least one required):*
-        - rulename: Main rule/alert description
-        - rule_text: Alternative field for rule text
-        - text: Generic text field
-        - top_k: Number of results to return (default: 1)
+        **Always check the status field:**
+        ```javascript
+        // In n8n Function node
+        if ($json.status === 'success') {
+            return {
+                success: true,
+                techniqueId: $json.results[0]?.technique_id,
+                techniqueName: $json.results[0]?.technique_name,
+                tactics: $json.results[0]?.tactics || []
+            };
+        } else {
+            return {
+                success: false,
+                error: $json.message
+            };
+        }
+        ```
         """)
         
-        st.subheader("🔧 Integration with n8n")
-        st.markdown("""
-        *Step 1:* Deploy this Streamlit app
-        *Step 2:* Use HTTP Request node in n8n
-        *Step 3:* Configure POST request to your Streamlit app
-        *Step 4:* Set Content-Type to application/json
-        *Step 5:* Send JSON payload with rule description
-        """)
-        
-        st.subheader("⚙ Installation Requirements")
-        st.code("""
-pip install streamlit attackcti sentence-transformers nltk requests urllib3
-        """, language="bash")
-        
-        st.subheader("🚀 Running the App")
-        st.code("""
-streamlit run mitre_app.py --server.port 8501
-        """, language="bash")
+        st.subheader("📋 Installation Requirements")
+        st.markdown("**Add to your `requirements.txt`:**")
+        st.code("""streamlit
+requests
+urllib3
+sentence-transformers
+nltk
+attackcti
+torch
+flask
+flask-cors""", language="text")
 
 if __name__ == "__main__":
     main()
